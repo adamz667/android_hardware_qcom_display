@@ -1821,7 +1821,9 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
         dev->device.prepare = hwc_prepare;
         dev->device.set = hwc_set;
         dev->device.registerProcs = hwc_registerProcs;
+#if defined HDMI_DUAL_DISPLAY
         dev->device.enableHDMIOutput = hwc_enableHDMIOutput;
+#endif
         *device = &dev->device.common;
 
         status = 0;
