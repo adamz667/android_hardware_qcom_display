@@ -154,6 +154,7 @@ bool isGPUSupportedFormat(int format) {
     return true;
 }
 
+#ifdef DECIDE_TEXTURE_TARGET
 /* decide the texture target dynamically, based on the pixel format*/
 
 int decideTextureTarget(int pixel_format)
@@ -180,6 +181,7 @@ int decideTextureTarget(int pixel_format)
   }
   return retVal;
 }
+#endif
 
 /*
  * Function to check if the allocated buffer is of the correct size.

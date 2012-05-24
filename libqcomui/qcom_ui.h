@@ -171,6 +171,7 @@ int checkBuffer(native_handle_t *buffer_handle, int size, int usage);
  */
 bool isGPUSupportedFormat(int format);
 
+#ifdef DECIDE_TEXTURE_TARGET
 /*
  * Adreno is not optimized for GL_TEXTURE_EXTERNAL_OES
  * texure target. DO NOT choose TEXTURE_EXTERNAL_OES
@@ -186,6 +187,7 @@ bool isGPUSupportedFormat(int format);
 */
 
 int decideTextureTarget (const int pixel_format);
+#endif
 
 /*
  * Gets the number of arguments required for this operation.
