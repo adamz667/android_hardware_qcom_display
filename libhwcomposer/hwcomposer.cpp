@@ -43,7 +43,6 @@
 #include <utils/profiler.h>
 #include <utils/IdleTimer.h>
 
-
 /*****************************************************************************/
 #define ALIGN(x, align) (((x) + ((align)-1)) & ~((align)-1))
 #define LIKELY( exp )       (__builtin_expect( (exp) != 0, true  ))
@@ -1451,7 +1450,7 @@ static int drawLayerUsingCopybit(hwc_composer_device_t *dev, hwc_layer_t *layer,
     copybit->set_parameter(copybit, COPYBIT_FRAMEBUFFER_HEIGHT, renderBuffer->height);
     copybit->set_parameter(copybit, COPYBIT_TRANSFORM, layer->transform);
     copybit->set_parameter(copybit, COPYBIT_PLANE_ALPHA,
-                           (layer->blending == HWC_BLENDING_NONE) ? -1 : layer->alpha);
+                           (layer->blending == HWC_BLENDING_NONE) ? 0x0 : layer->alpha);
     copybit->set_parameter(copybit, COPYBIT_PREMULTIPLIED_ALPHA,
                            (layer->blending == HWC_BLENDING_PREMULT)? COPYBIT_ENABLE : COPYBIT_DISABLE);
     copybit->set_parameter(copybit, COPYBIT_DITHER,
@@ -1821,7 +1820,6 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
         dev->device.prepare = hwc_prepare;
         dev->device.set = hwc_set;
         dev->device.registerProcs = hwc_registerProcs;
-#if defined HDMI_DUAL_DISPLAY
         dev->device.enableHDMIOutput = hwc_enableHDMIOutput;
 #endif
         *device = &dev->device.common;
