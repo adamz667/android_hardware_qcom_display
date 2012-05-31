@@ -50,6 +50,7 @@
 #endif
 
 #include <utils/profiler.h>
+#include <qcom_ui.h>
 
 #define FB_DEBUG 0
 
@@ -166,6 +167,12 @@ static void *disp_loop(void *ptr)
         if (ioctl(m->framebuffer->fd, FBIOPUT_VSCREENINFO, &m->info) == -1) {
             LOGE("ERROR FBIOPUT_VSCREENINFO failed; frame not displayed");
         }
+
+        //Signal so that we can close channels if we need to
+        pthread_mutex_lock(&m->bufferPostLock);
+        m->bufferPostDone = true;
+        pthread_cond_signal(&m->bufferPostCond);
+        pthread_mutex_unlock(&m->bufferPostLock);
 
         CALC_FPS();
 
@@ -286,6 +293,12 @@ static void *hdmi_ui_loop(void *ptr)
 
                    if (m->trueMirrorSupport)
                        flags &= ~WAIT_FOR_VSYNC;
+                   // External display connected during secure video playback
+                   // Open secure UI session
+                   // NOTE: when external display is already connected and then secure
+                   // playback is started, we dont have to do anything
+                   if(m->secureVideoOverlay)
+                       flags |= SECURE_OVERLAY_SESSION;
                    // start the overlay Channel for mirroring
                    // m->enableHDMIOutput corresponds to the fbnum
                    if (pTemp->startChannel(info, m->enableHDMIOutput,
@@ -381,27 +394,6 @@ static int fb_enableHDMIOutput(struct framebuffer_device_t* dev, int externaltyp
     return 0;
 }
 
-
-static int fb_setActionSafeWidthRatio(struct framebuffer_device_t* dev, float asWidthRatio)
-{
-    private_module_t* m = reinterpret_cast<private_module_t*>(
-            dev->common.module);
-    pthread_mutex_lock(&m->overlayLock);
-    m->actionsafeWidthRatio = asWidthRatio;
-    pthread_mutex_unlock(&m->overlayLock);
-    return 0;
-}
-
-static int fb_setActionSafeHeightRatio(struct framebuffer_device_t* dev, float asHeightRatio)
-{
-    private_module_t* m = reinterpret_cast<private_module_t*>(
-                    dev->common.module);
-    pthread_mutex_lock(&m->overlayLock);
-    m->actionsafeHeightRatio = asHeightRatio;
-    pthread_mutex_unlock(&m->overlayLock);
-    return 0;
-}
-
 static int fb_orientationChanged(struct framebuffer_device_t* dev, int orientation)
 {
     private_module_t* m = reinterpret_cast<private_module_t*>(
@@ -412,6 +404,63 @@ static int fb_orientationChanged(struct framebuffer_device_t* dev, int orientati
     return 0;
 }
 #endif
+
+//Wait until framebuffer content is displayed.
+////This is called in the context of threadLoop.
+////Display loop wakes this up after display.
+static int fb_waitForBufferPost(struct framebuffer_device_t* dev)
+{
+    private_module_t* m = reinterpret_cast<private_module_t*>(
+                            dev->common.module);
+    pthread_mutex_lock(&m->bufferPostLock);
+    while(m->bufferPostDone == false) {
+        pthread_cond_wait(&(m->bufferPostCond), &(m->bufferPostLock));
+    }
+    pthread_mutex_unlock(&m->bufferPostLock);
+    return 0;
+}
+
+static int fb_resetBufferPostStatus(struct framebuffer_device_t* dev)
+{
+    private_module_t* m = reinterpret_cast<private_module_t*>(
+                            dev->common.module);
+    pthread_mutex_lock(&m->bufferPostLock);
+    m->bufferPostDone = false;
+    pthread_mutex_unlock(&m->bufferPostLock);
+    return 0;
+}
+
+/* fb_perform - used to add custom event and handle them in fb HAL
+ * Used for external display related functions as of now
+*/
+static int fb_perform(struct framebuffer_device_t* dev, int event, int value)
+{
+    private_module_t* m = reinterpret_cast<private_module_t*>(
+            dev->common.module);
+    switch(event) {
+#if defined(HDMI_DUAL_DISPLAY)
+        case EVENT_EXTERNAL_DISPLAY:
+            fb_enableHDMIOutput(dev, value);
+            break;
+        case EVENT_VIDEO_OVERLAY:
+            fb_videoOverlayStarted(dev, value);
+            break;
+        case EVENT_ORIENTATION_CHANGE:
+            fb_orientationChanged(dev, value);
+            break;
+#endif
+        case EVENT_RESET_POSTBUFFER:
+            fb_resetBufferPostStatus(dev);
+            break;
+        case EVENT_WAIT_POSTBUFFER:
+            fb_waitForBufferPost(dev);
+            break;
+        default:
+            LOGE("In %s: UNKNOWN Event = %d!!!", __FUNCTION__, event);
+            break;
+    }
+    return 0;
+ }
 
 static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
 {
@@ -795,6 +844,9 @@ int mapFrameBufferLocked(struct private_module_t* module)
     module->hdmiMirroringState = HDMI_NO_MIRRORING;
     module->trueMirrorSupport = FrameBufferInfo::getInstance()->canSupportTrueMirroring();
 #endif
+    pthread_mutex_init(&(module->bufferPostLock), NULL);
+    pthread_cond_init(&(module->bufferPostCond), NULL);
+    module->bufferPostDone = false;
 
     return 0;
 }
@@ -850,13 +902,7 @@ int fb_device_open(hw_module_t const* module, const char* name,
         dev->device.setUpdateRect = 0;
         dev->device.compositionComplete = fb_compositionComplete;
         dev->device.lockBuffer = fb_lockBuffer;
-#if defined(HDMI_DUAL_DISPLAY)
-        dev->device.orientationChanged = fb_orientationChanged;
-        dev->device.videoOverlayStarted = fb_videoOverlayStarted;
-        dev->device.enableHDMIOutput = fb_enableHDMIOutput;
-        dev->device.setActionSafeWidthRatio = fb_setActionSafeWidthRatio;
-        dev->device.setActionSafeHeightRatio = fb_setActionSafeHeightRatio;
-#endif
+        dev->device.perform = fb_perform;
 
         private_module_t* m = (private_module_t*)module;
         status = mapFrameBuffer(m);

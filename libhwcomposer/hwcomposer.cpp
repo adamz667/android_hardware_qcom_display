@@ -86,6 +86,7 @@ struct hwc_context_t {
     native_handle_t *previousOverlayHandle;
     native_handle_t *currentOverlayHandle;
     int yuvBufferCount;
+    int numLayersNotUpdating;
 #ifdef COMPOSITION_BYPASS
     overlay::OverlayUI* mOvUI[MAX_BYPASS_LAYERS];
     native_handle_t* previousBypassHandle[MAX_BYPASS_LAYERS];
@@ -165,8 +166,18 @@ static inline int min(const int& a, const int& b) {
 static inline int max(const int& a, const int& b) {
     return (a > b) ? a : b;
 }
+
+inline void getLayerResolution(const hwc_layer_t* layer, int& width, int& height)
+{
+   hwc_rect_t displayFrame  = layer->displayFrame;
+
+   width = displayFrame.right - displayFrame.left;
+   height = displayFrame.bottom - displayFrame.top;
+}
+
 #ifdef COMPOSITION_BYPASS
 static void timeout_handler(void *udata) {
+    LOGD("Comp bypass timeout_handler...");
     struct hwc_context_t* ctx = (struct hwc_context_t*)(udata);
 
     if(!ctx) {
@@ -181,8 +192,9 @@ static void timeout_handler(void *udata) {
         return;
     }
     /* Trigger SF to redraw the current frame */
-    proc->invalidate(proc);
     ctx->idleTimeOut = true;
+    proc->invalidate(proc);
+    LOGD("Comp bypass timeout_handler...Done");
 }
 
 void setLayerbypassIndex(hwc_layer_t* layer, const int bypass_index)
@@ -379,7 +391,12 @@ static int prepareBypass(hwc_context_t *ctx, hwc_layer_t *layer,
 
         int fbnum = 0;
         int orientation = layer->transform;
-        const bool useVGPipe =  (nPipeIndex != (MAX_BYPASS_LAYERS-1));
+        const bool useVGPipe =
+#ifdef NO_BYPASS_CROPPING
+                (nPipeIndex != (MAX_BYPASS_LAYERS - 2));
+#else
+                (nPipeIndex != (MAX_BYPASS_LAYERS - 1));
+#endif
         //only last layer should wait for vsync
         const bool waitForVsync = vsync_wait;
         const bool isFg = isFG;
@@ -404,6 +421,23 @@ static int prepareBypass(hwc_context_t *ctx, hwc_layer_t *layer,
     }
     return 0;
 }
+
+#ifdef NO_BYPASS_CROPPING
+inline bool isLayerCropped(const hwc_layer_t* layer, int hw_w, int hw_h) {
+
+    int dst_w, dst_h;
+    getLayerResolution(layer, dst_w, dst_h);
+
+    hwc_rect_t sourceCrop = layer->sourceCrop;
+    const int src_w = sourceCrop.right - sourceCrop.left;
+    const int src_h = sourceCrop.bottom - sourceCrop.top;
+
+    hwc_rect_t dst = layer->displayFrame;
+
+    return dst.left < 0 || dst.top < 0 || dst.right > hw_w || dst.bottom > hw_h ||
+            src_w > dst_w || src_h > dst_h;
+}
+#endif
 
 /*
  * Checks if doing comp. bypass is possible.
@@ -448,6 +482,11 @@ inline static bool isBypassDoable(hwc_composer_device_t *dev, const int yuvCount
         return false;
     }
 
+#ifdef NO_BYPASS_CROPPING
+    int hw_w = hwcModule->fbDevice->width;
+    int hw_h = hwcModule->fbDevice->height;
+#endif
+
     //Bypass is not efficient if rotation or asynchronous mode is needed.
     for(int i = 0; i < list->numHwLayers; ++i) {
         if(list->hwLayers[i].transform) {
@@ -457,6 +496,11 @@ inline static bool isBypassDoable(hwc_composer_device_t *dev, const int yuvCount
             if (ctx->swapInterval > 0)
                 return false;
         }
+#ifdef NO_BYPASS_CROPPING
+        if (isLayerCropped(&(list->hwLayers[i]), hw_w, hw_h)) {
+            return false;
+        }
+#endif
     }
 
     return (yuvCount == 0) && (ctx->hwcOverlayStatus == HWC_OVERLAY_CLOSED)
@@ -559,29 +603,15 @@ void closeExtraPipes(hwc_context_t* ctx) {
     int pipes_used = ctx->nPipesUsed;
 
     //Unused pipes must be of higher z-order
+    //Note that MDP on closechannel call just marks the
+    //pipes for closure. The pipes are actually closed
+    //on next VSYNC
     for (int i =  pipes_used ; i < MAX_BYPASS_LAYERS; i++) {
-        private_handle_t *hnd = (private_handle_t*) ctx->previousBypassHandle[i];
-        if (hnd) {
-            if (!private_handle_t::validate(hnd)) {
-                if (GENLOCK_FAILURE == genlock_unlock_buffer(hnd)) {
-                    LOGE("%s: genlock_unlock_buffer failed", __FUNCTION__);
-                } else {
-                    ctx->previousBypassHandle[i] = NULL;
-                    ctx->bypassBufferLockState[i] = BYPASS_BUFFER_UNLOCKED;
-                    hnd->flags &= ~private_handle_t::PRIV_FLAGS_HWC_LOCK;
-                }
-            } else {
-                LOGE("%s: Unregistering invalid gralloc handle %p.",
-                    __FUNCTION__, hnd);
-                ctx->previousBypassHandle[i] = NULL;
-            }
-        }
         ctx->mOvUI[i]->closeChannel();
         ctx->layerindex[i] = -1;
     }
 }
 #endif  //COMPOSITION_BYPASS
-
 
 // Returns true if external panel is connected
 static inline bool isExternalConnected(const hwc_context_t* ctx) {
@@ -616,10 +646,10 @@ static inline void markForGPUComp(const hwc_context_t *ctx,
 }
 
 
-static int setVideoOverlayStatusInGralloc(hwc_context_t* ctx, const bool enable) {
+static int setVideoOverlayStatusInGralloc(hwc_context_t* ctx, const int value) {
 #if defined HDMI_DUAL_DISPLAY
     private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
-                                                           ctx->device.common.module);
+                                                    ctx->device.common.module);
     if(!hwcModule) {
         LOGE("%s: invalid params", __FUNCTION__);
         return -1;
@@ -631,8 +661,8 @@ static int setVideoOverlayStatusInGralloc(hwc_context_t* ctx, const bool enable)
         return -1;
     }
 
-    // Inform the gralloc to stop or start UI mirroring
-    fbDev->videoOverlayStarted(fbDev, enable);
+    // Inform the gralloc about the video overlay
+    fbDev->perform(fbDev, EVENT_VIDEO_OVERLAY, value);
 #endif
     return 0;
 }
@@ -651,7 +681,7 @@ static int hwc_closeOverlayChannels(hwc_context_t* ctx) {
         // gralloc to start UI mirroring
         ovLibObject->closeChannel();
         // Inform the gralloc that video overlay has stopped.
-        setVideoOverlayStatusInGralloc(ctx, false);
+        setVideoOverlayStatusInGralloc(ctx, VIDEO_OVERLAY_ENDED);
         ctx->hwcOverlayStatus = HWC_OVERLAY_CLOSED;
     }
 #endif
@@ -668,6 +698,8 @@ static int prepareOverlay(hwc_context_t *ctx, hwc_layer_t *layer, const int flag
      if(ctx && (ctx->bypassState != BYPASS_OFF)) {
         ctx->nPipesUsed = 0;
         closeExtraPipes(ctx);
+        unlockPreviousBypassBuffers(ctx);
+        unsetBypassBufferLockState(ctx);
         ctx->bypassState = BYPASS_OFF;
      }
 #endif
@@ -782,7 +814,7 @@ bool canSkipComposition(hwc_context_t* ctx, int yuvBufferCount, int currentLayer
         return false;
 
     //Video / Camera case
-    if (yuvBufferCount == 1) {
+    if (ctx->yuvBufferCount == 1) {
         //If the previousLayerCount is anything other than the current count, it
         //means something changed and we need to compose atleast once to FB.
         if (currentLayerCount != ctx->previousLayerCount) {
@@ -800,14 +832,6 @@ bool canSkipComposition(hwc_context_t* ctx, int yuvBufferCount, int currentLayer
         ctx->previousLayerCount = -1;
     }
     return false;
-}
-
-inline void getLayerResolution(const hwc_layer_t* layer, int& width, int& height)
-{
-   hwc_rect_t displayFrame  = layer->displayFrame;
-
-   width = displayFrame.right - displayFrame.left;
-   height = displayFrame.bottom - displayFrame.top;
 }
 
 static bool canUseCopybit(const framebuffer_device_t* fbDev, const hwc_layer_list_t* list) {
@@ -848,7 +872,7 @@ static void handleHDMIStateChange(hwc_composer_device_t *dev, int externaltype) 
     if(ExtDispOnly::isModeOn() == false) {
         framebuffer_device_t *fbDev = hwcModule->fbDevice;
         if (fbDev) {
-            fbDev->enableHDMIOutput(fbDev, externaltype);
+            fbDev->perform(fbDev, EVENT_EXTERNAL_DISPLAY, externaltype);
         }
         // Yield - Allows the UI channel(with zorder 0) to be opened first
         sched_yield();
@@ -905,6 +929,26 @@ static void hwc_enableHDMIOutput(hwc_composer_device_t *dev, int externaltype) {
 #endif
 }
 
+/* function to handle the custom events to hwc.
+ * event - type of event
+ * value - value associated with the event
+ */
+static void hwc_perform(hwc_composer_device_t *dev, int event, int value) {
+    hwc_context_t* ctx = (hwc_context_t*)(dev);
+    private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
+                                                           dev->common.module);
+    switch(event) {
+#if defined HDMI_DUAL_DISPLAY
+        case EVENT_EXTERNAL_DISPLAY:
+            hwc_enableHDMIOutput(dev, value);
+            break;
+#endif
+        default:
+            LOGE("In hwc:perform UNKNOWN EVENT = %d!!", event);
+            break;
+    }
+    return;
+}
 static bool isValidDestination(const framebuffer_device_t* fbDev, const hwc_rect_t& rect)
 {
     if (!fbDev) {
@@ -929,20 +973,6 @@ static bool isValidDestination(const framebuffer_device_t* fbDev, const hwc_rect
     }
 
     return true;
-}
-
-static int getYUVBufferCount (const hwc_layer_list_t* list) {
-    int yuvBufferCount = 0;
-    if (list) {
-        for (size_t i=0 ; i<list->numHwLayers; i++) {
-            private_handle_t *hnd = (private_handle_t *)list->hwLayers[i].handle;
-            if (hnd && (hnd->bufferType == BUFFER_TYPE_VIDEO) &&
-               !(list->hwLayers[i].flags & HWC_DO_NOT_USE_OVERLAY)) {
-                yuvBufferCount++;
-            }
-        }
-    }
-    return yuvBufferCount;
 }
 
 static int getS3DVideoFormat (const hwc_layer_list_t* list) {
@@ -1007,18 +1037,37 @@ static void markUILayerForS3DComposition (hwc_layer_t &layer, int s3dVideoFormat
     return;
 }
 
-static int getLayersNotUpdatingCount(const hwc_layer_list_t* list) {
-    int numLayersNotUpdating = 0;
-    if (list) {
-        for (size_t i=0 ; i<list->numHwLayers; i++) {
-            private_handle_t *hnd = (private_handle_t *)list->hwLayers[i].handle;
-            if (hnd && (hnd->bufferType != BUFFER_TYPE_VIDEO) &&
-               list->hwLayers[i].flags & HWC_LAYER_NOT_UPDATING)
-               numLayersNotUpdating++;
-        }
-    }
-    return numLayersNotUpdating;
-}
+/*
+ * This function loops thru the list of hwc layers and caches the
+ * layer details - such as yuvBuffer count, secure layer count etc.,(can
+ * add more in future)
+ * */
+static void statCount(hwc_context_t *ctx, hwc_layer_list_t* list) {
+    int yuvBufCount = 0;
+    int secureLayerCnt = 0;
+    int layersNotUpdatingCount = 0;
+     if (list) {
+         for (size_t i=0 ; i<list->numHwLayers; i++) {
+             private_handle_t *hnd = (private_handle_t *)list->hwLayers[i].handle;
+            if (hnd && (hnd->bufferType == BUFFER_TYPE_VIDEO) &&
+               !(list->hwLayers[i].flags & HWC_DO_NOT_USE_OVERLAY)) {
+               yuvBufCount++;
+            }
+            if (hnd &&  (hnd->bufferType == BUFFER_TYPE_VIDEO) &&
+                    (hnd->flags & private_handle_t::PRIV_FLAGS_SECURE_BUFFER) ) {
+                secureLayerCnt++;
+            }
+             if (hnd && (hnd->bufferType != BUFFER_TYPE_VIDEO) &&
+
+               list->hwLayers[i].flags & HWC_LAYER_NOT_UPDATING) {
+               layersNotUpdatingCount++;
+            }
+         }
+     }
+    ctx->yuvBufferCount = yuvBufCount;
+    ctx->numLayersNotUpdating = layersNotUpdatingCount;
+    return;
+ }
 
 
 static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
@@ -1044,36 +1093,31 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
         return -1;
     }
 
-    int yuvBufferCount = 0;
     int layerType = 0;
     bool isS3DCompositionNeeded = false;
     int s3dVideoFormat = 0;
-    int numLayersNotUpdating = 0;
     bool useCopybit = false;
     bool isSkipLayerPresent = false;
     bool skipComposition = false;
 
     if (list) {
         useCopybit = canUseCopybit(hwcModule->fbDevice, list);
-        ctx->yuvBufferCount = getYUVBufferCount(list);
-        yuvBufferCount = ctx->yuvBufferCount;
-        numLayersNotUpdating = getLayersNotUpdatingCount(list);
-        skipComposition = canSkipComposition(ctx, yuvBufferCount,
-                                list->numHwLayers, numLayersNotUpdating);
+        // cache the number of layer(like YUV, SecureBuffer, notupdating etc.,)
+        statCount(ctx, list);
+        skipComposition = canSkipComposition(ctx, ctx->yuvBufferCount,
+                                list->numHwLayers, ctx->numLayersNotUpdating);
 
-        if ((yuvBufferCount == 0) && (ctx->hwcOverlayStatus == HWC_OVERLAY_OPEN)) {
+        if ((ctx->yuvBufferCount == 0) && (ctx->hwcOverlayStatus == HWC_OVERLAY_OPEN)) {
             ctx->hwcOverlayStatus = HWC_OVERLAY_PREPARE_TO_CLOSE;
         }
 
-        if (yuvBufferCount == 1) {
+        if (ctx->yuvBufferCount == 1) {
             s3dVideoFormat = getS3DVideoFormat(list);
             if (s3dVideoFormat)
                 isS3DCompositionNeeded = isS3DCompositionRequired();
         } else if((s3dVideoFormat = getS3DFormat(list))){
             if (s3dVideoFormat)
                 isS3DCompositionNeeded = isS3DCompositionRequired();
-        } else {
-            unlockPreviousOverlayBuffer(ctx);
         }
 
         for (size_t i=0 ; i<list->numHwLayers ; i++) {
@@ -1094,7 +1138,6 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
                 if(isYuvBuffer(hnd) && !isExternalConnected(ctx)) {
                     if (ctx->hwcOverlayStatus == HWC_OVERLAY_OPEN)
                         ctx->hwcOverlayStatus = HWC_OVERLAY_PREPARE_TO_CLOSE;
-                    unlockPreviousOverlayBuffer(ctx);
                 }
                 // During the animaton UI layers are marked as SKIP
                 // need to still mark the layer for S3D composition
@@ -1104,13 +1147,14 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
                 list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
                 list->hwLayers[i].hints &= ~HWC_HINT_CLEAR_FB;
                 markForGPUComp(ctx, list, i);
-            } else if (hnd && (hnd->bufferType == BUFFER_TYPE_VIDEO) && (yuvBufferCount == 1)) {
-                setVideoOverlayStatusInGralloc(ctx, true);
-                int flags = WAIT_FOR_VSYNC;
+            } else if (hnd && (hnd->bufferType == BUFFER_TYPE_VIDEO) && (ctx->yuvBufferCount == 1)) {
+                int flags = skipComposition ? WAIT_FOR_VSYNC : 0;
                 flags |= (hnd->flags &
                        private_handle_t::PRIV_FLAGS_SECURE_BUFFER)?
                        SECURE_OVERLAY_SESSION : 0;
                 flags |= (1 == list->numHwLayers) ? DISABLE_FRAMEBUFFER_FETCH : 0;
+                int videoStarted = VIDEO_2D_OVERLAY_STARTED;
+                setVideoOverlayStatusInGralloc(ctx, videoStarted);
                 if (!isValidDestination(hwcModule->fbDevice, list->hwLayers[i].displayFrame)) {
                     list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
                     list->hwLayers[i].hints &= ~HWC_HINT_CLEAR_FB;
@@ -1122,7 +1166,6 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
                     skipComposition = false;
                     if (ctx->hwcOverlayStatus == HWC_OVERLAY_OPEN)
                         ctx->hwcOverlayStatus = HWC_OVERLAY_PREPARE_TO_CLOSE;
-                    unlockPreviousOverlayBuffer(ctx);
 #ifdef USE_OVERLAY
                 } else if(prepareOverlay(ctx, &(list->hwLayers[i]), flags) == 0) {
                     list->hwLayers[i].compositionType = HWC_USE_OVERLAY;
@@ -1142,16 +1185,16 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
                     list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
                 }
                 if (HWC_USE_OVERLAY != list->hwLayers[i].compositionType) {
-                    unlockPreviousOverlayBuffer(ctx);
                     skipComposition = false;
                 }
             } else if (getLayerS3DFormat(list->hwLayers[i])) {
-                setVideoOverlayStatusInGralloc(ctx, true);
-                int flags = WAIT_FOR_VSYNC;
+                int flags = skipComposition ? WAIT_FOR_VSYNC : 0;
                 flags |= (1 == list->numHwLayers) ? DISABLE_FRAMEBUFFER_FETCH : 0;
                 flags |= (hnd->flags &
                        private_handle_t::PRIV_FLAGS_SECURE_BUFFER)?
                        SECURE_OVERLAY_SESSION : 0;
+                int videoStarted = VIDEO_3D_OVERLAY_STARTED;
+                setVideoOverlayStatusInGralloc(ctx, videoStarted);
 #ifdef USE_OVERLAY
                 if(prepareOverlay(ctx, &(list->hwLayers[i]), flags) == 0) {
                     list->hwLayers[i].compositionType = HWC_USE_OVERLAY;
@@ -1191,7 +1234,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
 
 #ifdef COMPOSITION_BYPASS
         bool isBypassUsed = true;
-        bool isDoable = isBypassDoable(dev, yuvBufferCount, list);
+        bool isDoable = isBypassDoable(dev, ctx->yuvBufferCount, list);
         //Check if bypass is feasible
         if(isDoable && !isSkipLayerPresent) {
             if(setupBypass(ctx, list)) {
@@ -1574,6 +1617,8 @@ static int hwc_set(hwc_composer_device_t *dev,
 
     private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
                                                            dev->common.module);
+    framebuffer_device_t *fbDev = hwcModule->fbDevice;
+
     if (!hwcModule) {
         LOGE("hwc_set invalid module");
 #ifdef COMPOSITION_BYPASS
@@ -1584,6 +1629,14 @@ static int hwc_set(hwc_composer_device_t *dev,
         unlockPreviousOverlayBuffer(ctx);
         return -1;
     }
+#ifdef COMPOSITION_BYPASS
+    if(!list){
+        //Device in suspended state. Close all the MDP pipes
+        ctx->nPipesUsed = 0;
+    }
+    closeExtraPipes(ctx);
+#endif
+
 
     int ret = 0;
     if (list) {
@@ -1607,38 +1660,63 @@ static int hwc_set(hwc_composer_device_t *dev,
             }
         }
     } else {
-        //Device in suspended state. Close all the MDP pipes
-#ifdef COMPOSITION_BYPASS
-        ctx->nPipesUsed = 0;
-#endif
         ctx->hwcOverlayStatus =  HWC_OVERLAY_PREPARE_TO_CLOSE;
     }
     
 
     bool canSkipComposition = list && list->flags & HWC_SKIP_COMPOSITION;
+
+    //Draw External-only layers
+    if(ExtDispOnly::draw(ctx, list) != overlay::NO_ERROR) {
+        ExtDispOnly::close();
+    }
+
+#if BYPASS_DEBUG
+    if(canSkipComposition)
+        LOGE("%s: skipping eglSwapBuffer call", __FUNCTION__);
+#endif
+
+    // Do not call eglSwapBuffers if we the skip composition flag is set on the list.
+    if (dpy && sur && !canSkipComposition) {
+        //Wait for closing pipes and unlocking buffers until FB is done posting
+        //buffers, only if MDP pipes are in use. (Video, Comp.Bypass)
+        //For future releases we might wait even for UI updates. TBD.
+        bool waitForFBPost = false;
+
+#ifdef COMPOSITION_BYPASS
+        if(ctx->bypassState == BYPASS_OFF_PENDING)
+            waitForFBPost = true;
+#endif
+        if(ctx->hwcOverlayStatus != HWC_OVERLAY_CLOSED)
+            waitForFBPost = true;
+
+        //Reset FB post status before doing eglSwap
+        if(waitForFBPost)
+            fbDev->perform(fbDev, EVENT_RESET_POSTBUFFER, NULL);
+
+        EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
+        if (!sucess) {
+            ret = HWC_EGL_ERROR;
+        } else {
+            //If swap succeeds, wait till FB posts buffer for display.
+            if(waitForFBPost)
+              fbDev->perform(fbDev, EVENT_WAIT_POSTBUFFER, NULL);
+
+#ifdef COMPOSITION_BYPASS
+            if(ctx->bypassState == BYPASS_OFF_PENDING)
+              ctx->bypassState = BYPASS_OFF;
+#endif
+
+            CALC_FPS();
+        }
+    }
+
 #ifdef COMPOSITION_BYPASS
     unlockPreviousBypassBuffers(ctx);
     storeLockedBypassHandle(list, ctx);
     // We have stored the handles, unset the current lock states in the context.
     unsetBypassBufferLockState(ctx);
-    closeExtraPipes(ctx);
-#if BYPASS_DEBUG
-    if(canSkipComposition)
-        LOGE("%s: skipping eglSwapBuffer call", __FUNCTION__);
 #endif
-#endif
-    // Do not call eglSwapBuffers if we the skip composition flag is set on the list.
-    if (dpy && sur && !canSkipComposition) {
-        EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
-        if (!sucess) {
-            ret = HWC_EGL_ERROR;
-        }
-    } else {
-        CALC_FPS();
-    }
-
-    // Unlock the previously locked buffer, since the overlay has completed reading the buffer
-    unlockPreviousOverlayBuffer(ctx);
 
 #if defined HDMI_DUAL_DISPLAY
     if(ctx->pendingHDMI) {
@@ -1658,6 +1736,12 @@ static int hwc_set(hwc_composer_device_t *dev,
 #endif
 
     hwc_closeOverlayChannels(ctx);
+
+    // Unlock the previously locked vdeo buffer, since the overlay has completed
+    // reading the buffer. Should be done only after closing channels, if
+    // applicable.
+    unlockPreviousOverlayBuffer(ctx);
+
     return ret;
 }
 
@@ -1820,7 +1904,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
         dev->device.prepare = hwc_prepare;
         dev->device.set = hwc_set;
         dev->device.registerProcs = hwc_registerProcs;
-        dev->device.enableHDMIOutput = hwc_enableHDMIOutput;
+        dev->device.perform = hwc_perform;
         *device = &dev->device.common;
 
         status = 0;
