@@ -28,6 +28,7 @@
 #include <cutils/atomic.h>
 #include <cutils/properties.h>
 
+#include <gralloc_priv.h>
 #include <hardware/hwcomposer.h>
 #include <overlayLib.h>
 #include <overlayLibUI.h>
@@ -36,7 +37,6 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <ui/android_native_buffer.h>
-#include <gralloc_priv.h>
 #include <genlock.h>
 #include <qcom_ui.h>
 #include <gr.h>
@@ -148,7 +148,7 @@ struct private_hwc_module_t HAL_MODULE_INFO_SYM = {
 
 static void dump_layer(hwc_layer_t const* l) {
     LOGD("\ttype=%d, flags=%08x, handle=%p, tr=%02x, blend=%04x, {%d,%d,%d,%d}, {%d,%d,%d,%d}",
-            l->compositionType, l->flags, l->handle, l->transform, l->blending,
+            l->compositionType, l->flags, l->handle, l->transform & FINAL_TRANSFORM_MASK, l->blending,
             l->sourceCrop.left,
             l->sourceCrop.top,
             l->sourceCrop.right,
@@ -390,7 +390,7 @@ static int prepareBypass(hwc_context_t *ctx, hwc_layer_t *layer,
         info.size = hnd->size;
 
         int fbnum = 0;
-        int orientation = layer->transform;
+        int orientation = layer->transform & FINAL_TRANSFORM_MASK;
         const bool useVGPipe =
 #ifdef NO_BYPASS_CROPPING
                 (nPipeIndex != (MAX_BYPASS_LAYERS - 2));
@@ -489,7 +489,7 @@ inline static bool isBypassDoable(hwc_composer_device_t *dev, const int yuvCount
 
     //Bypass is not efficient if rotation or asynchronous mode is needed.
     for(int i = 0; i < list->numHwLayers; ++i) {
-        if(list->hwLayers[i].transform) {
+        if(list->hwLayers[i].transform & FINAL_TRANSFORM_MASK) {
             return false;
         }
         if(list->hwLayers[i].flags & HWC_LAYER_ASYNCHRONOUS) {
@@ -636,12 +636,25 @@ static inline bool isBufferLocked(const private_handle_t* hnd) {
     return (hnd && (private_handle_t::PRIV_FLAGS_HWC_LOCK & hnd->flags));
 }
 
-//Marks layers for GPU composition
+static int getLayerS3DFormat (hwc_layer_t &layer) {
+    int s3dFormat = 0;
+    private_handle_t *hnd = (private_handle_t *)layer.handle;
+    if (hnd)
+        s3dFormat = FORMAT_3D_INPUT(hnd->format);
+    return s3dFormat;
+}
+
+//Mark layers for GPU composition but not if it is a 3D layer.
 static inline void markForGPUComp(const hwc_context_t *ctx,
     hwc_layer_list_t* list, const int limit) {
     for(int i = 0; i < limit; i++) {
-        list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
-        list->hwLayers[i].hints &= ~HWC_HINT_CLEAR_FB;
+        if( getLayerS3DFormat( list->hwLayers[i] ) ) {
+            continue;
+        }
+        else {
+            list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
+            list->hwLayers[i].hints &= ~HWC_HINT_CLEAR_FB;
+        }
     }
 }
 
@@ -1004,13 +1017,6 @@ static int getS3DFormat (const hwc_layer_list_t* list) {
 }
 
 
-static int getLayerS3DFormat (hwc_layer_t &layer) {
-    int s3dFormat = 0;
-    private_handle_t *hnd = (private_handle_t *)layer.handle;
-    if (hnd)
-        s3dFormat = FORMAT_3D_INPUT(hnd->format);
-    return s3dFormat;
-}
 static bool isS3DCompositionRequired() {
 #ifdef HDMI_AS_PRIMARY
     return overlay::is3DTV();
@@ -1660,7 +1666,8 @@ static int hwc_set(hwc_composer_device_t *dev,
             }
         }
     } else {
-        ctx->hwcOverlayStatus =  HWC_OVERLAY_PREPARE_TO_CLOSE;
+            if (ctx->hwcOverlayStatus == HWC_OVERLAY_OPEN)
+                ctx->hwcOverlayStatus =  HWC_OVERLAY_PREPARE_TO_CLOSE;
     }
     
 
