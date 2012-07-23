@@ -41,7 +41,7 @@
 #include <qcom_ui.h>
 #include <gr.h>
 #include <utils/profiler.h>
-#include <utils/IdleTimer.h>
+#include <utils/IdleInvalidator.h>
 
 /*****************************************************************************/
 #define ALIGN(x, align) (((x) + ((align)-1)) & ~((align)-1))
@@ -94,14 +94,13 @@ struct hwc_context_t {
     int layerindex[MAX_BYPASS_LAYERS];
     int nPipesUsed;
     BypassState bypassState;
-    IdleTimer idleTimer;
-    bool idleTimeOut;
+    IdleInvalidator *idleInvalidator;
 #endif
 #if defined HDMI_DUAL_DISPLAY
     external_display_type mHDMIEnabled; // Type of external display
     bool pendingHDMI;
-    bool forceComposition; //Used to force composition on HDMI connection.
 #endif
+    bool forceComposition; //Used to force composition.
     int previousLayerCount;
     eHWCOverlayStatus hwcOverlayStatus;
     int swapInterval;
@@ -178,7 +177,7 @@ inline void getLayerResolution(const hwc_layer_t* layer, int& width, int& height
 
 #ifdef COMPOSITION_BYPASS
 static void timeout_handler(void *udata) {
-    LOGD("Comp bypass timeout_handler...");
+    LOGE("Comp bypass timeout_handler...");
     struct hwc_context_t* ctx = (struct hwc_context_t*)(udata);
 
     if(!ctx) {
@@ -193,9 +192,9 @@ static void timeout_handler(void *udata) {
         return;
     }
     /* Trigger SF to redraw the current frame */
-    ctx->idleTimeOut = true;
+    ctx->forceComposition = true;
     proc->invalidate(proc);
-    LOGD("Comp bypass timeout_handler...Done");
+    LOGE("Comp bypass timeout_handler...Done");
 }
 
 void setLayerbypassIndex(hwc_layer_t* layer, const int bypass_index)
@@ -478,8 +477,7 @@ inline static bool isBypassDoable(hwc_composer_device_t *dev, const int yuvCount
         return false;
     }
 
-    if(ctx->idleTimeOut) {
-        ctx->idleTimeOut = false;
+    if(ctx->forceComposition) {
         return false;
     }
 
@@ -821,12 +819,9 @@ bool canSkipComposition(hwc_context_t* ctx, int yuvBufferCount, int currentLayer
         return false;
     }
 
-#if defined HDMI_DUAL_DISPLAY
     if(ctx->forceComposition) {
-        ctx->forceComposition = false;
         return false;
     }
-#endif
 
     hwc_composer_device_t* dev = (hwc_composer_device_t *)(ctx);
     private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
@@ -895,6 +890,8 @@ static void handleHDMIStateChange(hwc_composer_device_t *dev, int externaltype) 
         if (fbDev) {
             fbDev->perform(fbDev, EVENT_EXTERNAL_DISPLAY, externaltype);
         }
+        // Yield - Allows the UI channel(with zorder 0) to be opened first
+        sched_yield();
         if(ctx && ctx->mOverlayLibObject) {
             overlay::Overlay *ovLibObject = ctx->mOverlayLibObject;
             if (!externaltype) {
@@ -1278,6 +1275,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
 #endif
         unlockPreviousOverlayBuffer(ctx);
     }
+    ctx->forceComposition = false;
     return 0;
 }
 // ---------------------------------------------------------------------------
@@ -1358,12 +1356,10 @@ static int drawLayerUsingCopybit(hwc_composer_device_t *dev, hwc_layer_t *layer,
         genlock_unlock_buffer(hnd);
         return -1;
     }
-    int alignment = 32;
-    if( HAL_PIXEL_FORMAT_RGB_565 == fbHandle->format )
-        alignment = 16;
-     // Set the copybit source:
+
+    // Set the copybit source:
     copybit_image_t src;
-    src.w = ALIGN(hnd->width, alignment);
+    src.w = hnd->width;
     src.h = hnd->height;
     src.format = hnd->format;
     src.base = (void *)hnd->base;
@@ -1390,7 +1386,7 @@ static int drawLayerUsingCopybit(hwc_composer_device_t *dev, hwc_layer_t *layer,
 
     // Copybit dst
     copybit_image_t dst;
-    dst.w = ALIGN(fbHandle->width,alignment);
+    dst.w = ALIGN(fbHandle->width,32);
     dst.h = fbHandle->height;
     dst.format = fbHandle->format;
     dst.base = (void *)fbHandle->base;
@@ -1660,7 +1656,8 @@ static int hwc_set(hwc_composer_device_t *dev,
                 continue;
 #ifdef COMPOSITION_BYPASS
             } else if (list->hwLayers[i].flags & HWC_COMP_BYPASS) {
-                ctx->idleTimer.reset();
+                if(ctx->idleInvalidator)
+                    ctx->idleInvalidator->markForSleep();
                 drawLayerUsingBypass(ctx, &(list->hwLayers[i]), i);
 #endif
             } else if (list->hwLayers[i].compositionType == HWC_USE_OVERLAY) {
@@ -1786,11 +1783,11 @@ static int hwc_device_close(struct hw_device_t *dev)
          delete ctx->mOverlayLibObject;
          ctx->mOverlayLibObject = NULL;
 #ifdef COMPOSITION_BYPASS
-            for(int i = 0; i < MAX_BYPASS_LAYERS; i++) {
-                delete ctx->mOvUI[i];
-            }
-            unlockPreviousBypassBuffers(ctx);
-            unsetBypassBufferLockState(ctx);
+         for(int i = 0; i < MAX_BYPASS_LAYERS; i++) {
+             delete ctx->mOvUI[i];
+         }
+         unlockPreviousBypassBuffers(ctx);
+         unsetBypassBufferLockState(ctx);
 #endif
         ExtDispOnly::close();
         ExtDispOnly::destroy();
@@ -1890,9 +1887,14 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
                 idle_timeout = atoi(property);
         }
 
-        dev->idleTimer.create(timeout_handler, dev);
-        dev->idleTimer.setFreq(idle_timeout);
-        dev->idleTimeOut = false;
+        //create Idle Invalidator
+        dev->idleInvalidator = IdleInvalidator::getInstance();
+
+        if(dev->idleInvalidator == NULL) {
+            LOGE("%s: failed to instantiate idleInvalidator object", __FUNCTION__);
+        } else {
+            dev->idleInvalidator->init(timeout_handler, dev, idle_timeout);
+        }
 #endif
         ExtDispOnly::init();
 #if defined HDMI_DUAL_DISPLAY
