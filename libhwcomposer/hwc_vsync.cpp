@@ -104,9 +104,11 @@ static void *vsync_loop(void *param)
 
         for(int i = 0; i < MAX_RETRY_COUNT; i++) {
             len = pread(fb_timestamp, vdata, MAX_DATA, 0);
-            if(len < 0 && errno == EAGAIN) {
-                ALOGW("%s: vsync read: EAGAIN, retry (%d/%d).",
-                                        __FUNCTION__, i, MAX_RETRY_COUNT);
+            if(len < 0 && (errno == EAGAIN ||
+                           errno == EINTR  ||
+                           errno == EBUSY)) {
+                ALOGW("%s: vsync read: %s, retry (%d/%d).",
+                      __FUNCTION__, strerror(errno), i, MAX_RETRY_COUNT);
                 continue;
             } else {
                 break;
